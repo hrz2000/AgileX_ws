@@ -1,4 +1,4 @@
-"""Offline ROS1 -> LeRobot v3 conversion for the right-arm SDK recordings.
+"""Offline ROS1 -> LeRobot v3 conversion for Piper recordings.
 
 Read bags twice: first index source timestamps and small numeric arrays, then
 stream selected RGB frames. Neither ROS nor the hardware SDK is imported.
@@ -164,20 +164,36 @@ def sample_indices(stamps, grid, mode="previous"):
     return np.where(abs(stamps[after] - grid) < abs(stamps[before] - grid), after, before)
 
 
+def camera_names(cfg):
+    return ("cam_h", "cam_l", "cam_r") if len(cfg["joint_names"]) == 14 else CAMERAS
+
+
+def image_feature(cam, cfg):
+    if len(cfg["joint_names"]) == 14:
+        cam = {"cam_h": "cam_high", "cam_l": "cam_left_wrist", "cam_r": "cam_right_wrist"}[cam]
+    return "observation.images." + cam
+
+
 def load_config(path):
     cfg = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
     if not isinstance(cfg, dict) or cfg.get("schema_version") != 1:
         raise ValueError("Expected schema_version: 1 conversion config")
-    names = ["right_joint_%d" % i for i in range(1, 7)] + ["right_gripper_width"]
-    if cfg.get("joint_names") != names:
-        raise ValueError("This converter requires the canonical seven-component right-arm contract")
-    expected = {"state": "/piper/arms/right/follower/joint_states", "action": "/piper/action",
-                **{cam: "/piper/cameras/%s/color/image_raw" % cam for cam in CAMERAS}}
+    right = ["right_joint_%d" % i for i in range(1, 7)] + ["right_gripper_width"]
+    left = ["left_joint_%d" % i for i in range(1, 7)] + ["left_gripper_width"]
+    names = cfg.get("joint_names")
+    if names not in (right, left + right):
+        raise ValueError("Expected canonical right-arm or left-then-right joint names")
+    dual = len(names) == 14
+    expected = {"state": "/piper/state" if dual else "/piper/arms/right/follower/joint_states",
+                "action": "/piper/action",
+                **{cam: "/piper/cameras/%s/color/image_raw" % cam for cam in camera_names(cfg)}}
     if {key: value["topic"] for key, value in cfg["sources"].items()} != expected:
         raise ValueError("Source mapping must preserve follower feedback / forwarded leader action / RGB semantics")
     if cfg.get("action_metadata_topic") != "/piper/action_metadata":
         raise ValueError("Forwarded actions require /piper/action_metadata")
     if "motor_state" in cfg:
+        if dual:
+            raise ValueError("Dual-arm motor diagnostics are not supported")
         motor = cfg["motor_state"]
         if not isinstance(motor, dict) or motor.get("topic") != MOTOR_DIAGNOSTICS_TOPIC:
             raise ValueError("Motor state requires the right follower diagnostics topic")
@@ -206,9 +222,10 @@ def check_manifest(bag, cfg):
     manifest = json.loads((bag.parent / "manifest.json").read_text(encoding="utf-8"))
     if manifest.get("status") != "complete":
         raise ValueError("Recording manifest is not complete: " + str(bag))
-    if (manifest["selection"]["arms"] != ["right"]
-            or set(manifest["selection"]["cameras"]) != set(CAMERAS)):
-        raise ValueError("Manifest is not right arm + cam_h/cam_r: " + str(bag))
+    arms = ["left", "right"] if len(cfg["joint_names"]) == 14 else ["right"]
+    if (manifest["selection"]["arms"] != arms
+            or set(manifest["selection"]["cameras"]) != set(camera_names(cfg))):
+        raise ValueError("Manifest arm/camera selection disagrees with config: " + str(bag))
     obs = manifest["config"]["observation"]
     if obs.get("action_semantics") != "absolute_joint_position_rad_gripper_m":
         raise ValueError("Manifest has incompatible action units/semantics")
@@ -298,7 +315,7 @@ def read_index(bag, cfg):
             stamp = header_ns(msg)
             if abs(stamp - bag_stamp) > cfg["sync"]["max_clock_skew_sec"] * NS:
                 raise ValueError("Source/receipt clock discrepancy exceeds limit: " + connection.topic)
-            if key in CAMERAS:
+            if key in camera_names(cfg):
                 shape = rgb_shape(msg)
                 if source.shape is not None and source.shape != shape:
                     raise ValueError("Camera resolution changed: " + connection.topic)
@@ -360,8 +377,8 @@ def feature_schema(cfg, series):
         "observation.state": {"dtype": "float32", "shape": (len(observation_names),), "names": observation_names},
         "action": {"dtype": "float32", "shape": (len(cfg["joint_names"]),), "names": cfg["joint_names"]},
     }
-    for cam in CAMERAS:
-        features["observation.images." + cam] = {"dtype": "video", "shape": series[cam].shape,
+    for cam in camera_names(cfg):
+        features[image_feature(cam, cfg)] = {"dtype": "video", "shape": series[cam].shape,
                                                "names": ["height", "width", "channels"]}
     return features
 
@@ -392,11 +409,12 @@ def numeric_hash(array):
 def write_episode(dataset, bag, cfg, series, grid, selected):
     from rosbags.highlevel import AnyReader
 
-    wanted = {cam: defaultdict(list) for cam in CAMERAS}
-    for cam in CAMERAS:
+    cameras = camera_names(cfg)
+    wanted = {cam: defaultdict(list) for cam in cameras}
+    for cam in cameras:
         for frame, index in enumerate(selected[cam]):
             wanted[cam][int(series[cam].ordinals[index])].append(frame)
-    topics = {cfg["sources"][cam]["topic"]: cam for cam in CAMERAS}
+    topics = {cfg["sources"][cam]["topic"]: cam for cam in cameras}
     seen, pending, next_frame = defaultdict(int), {}, 0
     with AnyReader([bag]) as reader:
         connections = [c for c in reader.connections if c.topic in topics]
@@ -408,8 +426,8 @@ def write_episode(dataset, bag, cfg, series, grid, selected):
                 continue
             array = decode_rgb(reader.deserialize(raw, connection.msgtype))
             for frame in frames:
-                pending.setdefault(frame, {})["observation.images." + cam] = array
-            while next_frame in pending and len(pending[next_frame]) == len(CAMERAS):
+                pending.setdefault(frame, {})[image_feature(cam, cfg)] = array
+            while next_frame in pending and len(pending[next_frame]) == len(cameras):
                 frame = numeric_frame(series, selected, next_frame)
                 frame.update(pending.pop(next_frame))
                 frame["task"] = cfg["dataset"]["task"]
@@ -448,8 +466,8 @@ def validate_dataset(root, cfg, plans):
         np.testing.assert_array_equal(np.asarray(rows["episode_index"]).reshape(-1), np.full(count, episode))
         for index in (offset, offset + count - 1):
             frame = dataset[index]
-            for cam in CAMERAS:
-                image = frame["observation.images." + cam]
+            for cam in camera_names(cfg):
+                image = frame[image_feature(cam, cfg)]
                 height, width, _ = plan["series"][cam].shape
                 if tuple(image.shape) != (3, height, width) or not np.isfinite(image.numpy()).all():
                     raise ValueError("Invalid decoded video: " + cam)
@@ -483,7 +501,7 @@ def run(args):
               "timing": "15 Hz by default; causal previous sampling using header stamps and individual motor source stamps; no gap compression",
               "action": "HUMAN forwarded_can_target; absolute joints rad + gripper m",
               "state": {"component_names": state_names(cfg),
-                        "units": ["rad"] * 6 + ["m"] + (["A"] * 6 + ["N*m"] * 6 if "motor_state" in cfg else [])},
+                        "units": (["rad"] * 6 + ["m"]) * (len(cfg["joint_names"]) // 7) + (["A"] * 6 + ["N*m"] * 6 if "motor_state" in cfg else [])},
               "omitted": ["depth", "camera calibration", "other diagnostics" if "motor_state" in cfg else "diagnostics", "empty velocity/effort"],
               "success_labels": "Not inferred from recording completeness",
               "converter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
@@ -511,7 +529,10 @@ def run(args):
         if bag_identity(bag) != identity:
             raise ValueError("Bag changed during inspection: " + str(bag))
         arrays = numeric_arrays(series, selected)
-        item = {"episode_index": index, "source": identity, "frames": len(grid), "sources": summary,
+        manifest = json.loads((bag.parent / "manifest.json").read_text(encoding="utf-8"))
+        item = {"episode_index": index, "source": identity,
+                "source_manifest_task": manifest["config"]["observation"].get("task"),
+                "frames": len(grid), "sources": summary,
                 "evidence": evidence, "grid_start_ns": int(grid[0]), "grid_end_ns": int(grid[-1]),
                 "trimmed_start_sec": (int(grid[0]) - bounds["bag_start_ns"]) / NS,
                 "trimmed_end_sec": (bounds["bag_end_ns"] - int(grid[-1])) / NS,

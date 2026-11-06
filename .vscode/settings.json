@@ -7,5 +7,14 @@
         "editor.detectIndentation": false
     },
     "black-formatter.args": ["--line-length", "88"],
-    "black-formatter.importStrategy": "useBundled"
+    "black-formatter.importStrategy": "useBundled",
+    "files.exclude": {
+        "**/.git": true,
+        "**/.svn": true,
+        "**/.hg": true,
+        "**/.jj": true,
+        "**/.DS_Store": true,
+        "**/Thumbs.db": true,
+        "hydralance": true
+    }
 }

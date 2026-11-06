@@ -81,6 +81,22 @@ RGB 保持 640×480，输出 H.264 视频（CRF 18，有损编码）。原配置
 
 官方格式和 `finalize()` 要求见 [LeRobotDataset v3 文档](https://huggingface.co/docs/lerobot/lerobot-dataset-v3)。
 
+### 双臂 Piper ROS bag → LeRobot v3
+
+使用 `configs/lerobot_stand_up_bottles_dual.yaml` 配合原有 `scripts/bag_to_lerobot.py`，可重复转换采用同一采集协议的双臂 Piper bag。每个 episode 目录须有完整的 `data.bag` 和 `manifest.json`；输入输出均可通过命令行替换，输出目录必须不存在：
+
+```bash
+export LEROBOT_PYTHON=/path/to/lerobot-python
+bash scripts/convert_lerobot.sh --config configs/lerobot_stand_up_bottles_dual.yaml --input /path/to/bags --inspect
+bash scripts/convert_lerobot.sh --config configs/lerobot_stand_up_bottles_dual.yaml --input /path/to/bags --output /path/to/new-lerobot-dataset
+```
+
+脚本不连接硬件、不上传数据。任务文字、帧率和同步阈值写在配置中；处理不同任务时应复制并修改配置中的 `dataset.task`，不要沿用本例标签。本批源清单写了插头任务，但用户确认本批为扶正瓶子；原任务文字保留在每个 episode 的转换记录中。
+
+`observation.state` 来自 `/piper/state` 从臂实测，`action` 来自 `/piper/action` 已转发控制目标；二者均为左臂六关节和夹爪、右臂六关节和夹爪，共 14 维，关节为 rad、夹爪为 m。动作来源与时间戳及 14 个数值逐条对照 `/piper/action_metadata`，仅允许有证据的人工转发命令。三路 RGB 映射为 `observation.images.cam_high`、`observation.images.cam_left_wrist`、`observation.images.cam_right_wrist`。默认 15 Hz，使用不晚于采样时刻的最近消息，超过阈值直接报错。
+
+参考的 RoboDojo Real Piper 是 HDF5，按左后右组织各 8 维末端位姿及夹爪，本输出是 14 维关节数据，不能直接作为该 HDF5 loader 或其 EE16 动作统计的输入；若需要 EE16，须另行核对对应的 Piper URDF、工具点与坐标系后执行 FK。深度、标定和诊断仍在原 bag，不推断成功标签。检查、临时目录、官方读取器验证与时间戳记录规则同前节。
+
 ### 将电流和估算力矩加入 observation.state
 
 [`configs/lerobot_insert_plug_v4_with_motor_state.yaml`](../configs/lerobot_insert_plug_v4_with_motor_state.yaml)

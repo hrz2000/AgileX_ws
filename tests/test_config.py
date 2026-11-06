@@ -99,6 +99,7 @@ class ConfigTests(unittest.TestCase):
             "lerobot_insert_plug_random.yaml",
             "lerobot_insert_plug_v4.yaml",
             "lerobot_insert_plug_v4_with_motor_state.yaml",
+            "lerobot_stand_up_bottles_dual.yaml",
         }
         for path in CONFIGS.glob("*.yaml"):
             with self.subTest(path=path):
